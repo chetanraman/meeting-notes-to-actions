@@ -2,7 +2,7 @@
 
 Paste messy meeting notes or a raw transcript. Get back three clean artifacts a program manager actually needs: a **decision log**, an **action-item table** (owner + due date), and a **draft status update**.
 
-**[Live demo](ADD_YOUR_STREAMLIT_URL_HERE)**
+**[Live demo](https://meeting-notes-to-actions-fqk5ityu787vqcnt8i9sna.streamlit.app/)**
 
 ---
 
