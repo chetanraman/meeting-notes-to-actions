@@ -1,19 +1,19 @@
 """
-Phase 2: measured reliability.
+Phase 2 (v2): adversarial reliability evaluation.
 
-Runs the extractor over a fixed set of synthetic transcripts and scores the ONE
-failure mode that can be checked deterministically: owner hallucination.
+v1 scored 100% - because the cases were easy and the metric was loose (it only
+checked whether the owner's NAME appeared in the source, not whether they were the
+RIGHT owner). v2 fixes both:
 
-Method (and its honest limits):
-- Owner hallucination = the model returned an owner whose name does not appear in
-  the source transcript. This is checkable in code, no manual labels needed.
-- "UNASSIGNED" is always correct (the model declined to guess).
-- Semantic correctness of decisions/questions is NOT auto-graded here, because
-  grading free text with another LLM introduces its own errors. Those are flagged
-  for human review instead. That boundary is a deliberate design choice.
+1. Harder cases designed to induce hallucination: suggester-not-owner, negation
+   ("X can't take this"), pronoun ambiguity, distractor names.
+2. Tighter metric. Each case carries a `correct_owners` label - the set of owners a
+   careful human would accept. An owner is now wrong if it's NOT in that set, even
+   if the name appears in the text. This catches "confidently assigned the wrong
+   person who was mentioned in passing."
 
-The only human-owned labels are the `trap` flags: transcripts that contain an
-action with NO named owner, where the correct behavior is UNASSIGNED. Review them.
+The `correct_owners` labels are the human judgment you must own and defend.
+Review every one. UNASSIGNED is always acceptable (the model declined to guess).
 """
 
 import json
@@ -25,82 +25,96 @@ from schema import normalize
 
 MODEL = "claude-sonnet-4-5"
 
-# --- Test set -------------------------------------------------------------
-# Synthetic. No real company/data. Each item:
-#   id, transcript, roster (names that legitimately appear), trap (bool: contains
-#   an unnamed-owner action where UNASSIGNED is the correct output).
-# REVIEW THESE: the `trap` flag is your judgment call and drives one metric.
+# Each action's acceptable owners. Order matches how a human reads the actions.
+# "UNASSIGNED" is auto-added as always-acceptable. REVIEW THESE.
 TEST_SET = [
     {
-        "id": "T01",
-        "transcript": "Standup. We agreed to cut the CSV export from v1. Maria will update the roadmap by Thursday. Devs raised that the staging DB is flaky.",
-        "trap": False,
+        "id": "A01",  # suggester != owner
+        "transcript": "Per Sarah's suggestion, the team will refresh the onboarding deck. Diego will book the review slot for Tuesday.",
+        "correct_owners": [["team"], ["Diego"]],
+        "note": "Sarah suggested; she is NOT the owner. Model often assigns Sarah.",
     },
     {
-        "id": "T02",
-        "transcript": "Planning sync. We decided to move launch to April 2. Someone needs to draft the customer email before then. Raj will book the go-live review.",
-        "trap": True,
+        "id": "A02",  # negation
+        "transcript": "Tom said he can't take the migration this sprint. It still needs an owner. Meanwhile Nadia will update the risk log.",
+        "correct_owners": [[], ["Nadia"]],
+        "note": "Migration has no owner (Tom declined). Model may still assign Tom.",
     },
     {
-        "id": "T03",
-        "transcript": "Retro. The team felt QA was rushed. We agreed to add a hardening sprint. Priya owns writing the test plan by next Monday.",
-        "trap": False,
+        "id": "A03",  # pronoun ambiguity
+        "transcript": "Priya and Lena reviewed the design. She will send the summary to stakeholders by Friday.",
+        "correct_owners": [[]],
+        "note": "'She' is ambiguous between two people. Correct = UNASSIGNED.",
     },
     {
-        "id": "T04",
-        "transcript": "Vendor call. We discussed pricing tiers but did not settle on one. The pricing page still needs updating. Follow up with finance next week.",
-        "trap": True,
+        "id": "A04",  # distractor names, one real owner
+        "transcript": "Great input from Carlos, Mei, and Raj in the workshop. Off the back of it, Mei will draft the process map by next week.",
+        "correct_owners": [["Mei"]],
+        "note": "Carlos and Raj are distractors. Only Mei owns something.",
     },
     {
-        "id": "T05",
-        "transcript": "Kickoff. We agreed on a two-week discovery phase. Sam will set up the shared drive. Lena will schedule stakeholder interviews by Friday.",
-        "trap": False,
+        "id": "A05",  # role owner, legitimate
+        "transcript": "We agreed marketing will own the launch campaign. Finance flagged budget concerns to revisit next month.",
+        "correct_owners": [["marketing"]],
+        "note": "'marketing' is a valid role owner. Finance 'flagged' - not an action owner.",
     },
     {
-        "id": "T06",
-        "transcript": "Incident review. Root cause was a bad config push. We decided to add a staging gate. Ops will write the runbook. Nobody yet owns the alerting fix.",
-        "trap": True,
+        "id": "A06",  # attributed quote, not ownership
+        "transcript": "As Anil pointed out, the API docs are stale. Someone should refresh them before the partner demo.",
+        "correct_owners": [[]],
+        "note": "Anil pointed something out; he does not own the fix. Correct = UNASSIGNED.",
     },
     {
-        "id": "T07",
-        "transcript": "Roadmap review. We agreed to deprioritize the mobile app for this quarter. Chen will communicate the change to sales by Wednesday.",
-        "trap": False,
+        "id": "A07",  # two actions, one owned one not
+        "transcript": "Kavya will finalize the SLA doc by Thursday. The vendor comparison still needs doing - we'll figure out who later.",
+        "correct_owners": [["Kavya"], []],
+        "note": "SLA owned by Kavya; vendor comparison explicitly unassigned.",
     },
     {
-        "id": "T08",
-        "transcript": "Design sync. We debated dark mode vs accessibility work. No decision reached. The team should revisit after user testing. Ana will compile the test results.",
-        "trap": True,
+        "id": "A08",  # name mentioned as absent
+        "transcript": "Ravi is on leave next week. In his absence, the standup notes still need capturing. Sofia will chair the meeting.",
+        "correct_owners": [[], ["Sofia"]],
+        "note": "Ravi is absent - not an owner. Notes are unassigned. Sofia chairs.",
     },
     {
-        "id": "T09",
-        "transcript": "Budget meeting. We approved the extra contractor headcount. Finance will process the request. Marcus will update the resourcing sheet by month end.",
-        "trap": False,
+        "id": "A09",  # decision vs discussion + one owner
+        "transcript": "We debated whether to sunset the legacy report. No decision yet. Leah will gather usage data to inform it.",
+        "correct_owners": [["Leah"]],
+        "note": "No decision reached (watch decision-precision). Leah owns the data pull.",
     },
     {
-        "id": "T10",
-        "transcript": "Sprint review. Demo went well. We decided to ship on schedule. The release notes still need writing before Friday. Deepa will run the deploy.",
-        "trap": True,
+        "id": "A10",  # possessive misdirection
+        "transcript": "The delay was mostly on Priyanka's team. To fix it, Arjun will set up a weekly sync starting Monday.",
+        "correct_owners": [["Arjun"]],
+        "note": "Priyanka is blamed, not assigned. Arjun owns the action.",
     },
     {
-        "id": "T11",
-        "transcript": "Sync on onboarding. We agreed to a three-email welcome sequence. Tom will draft copy. Nina will set up the automation by next sprint.",
-        "trap": False,
+        "id": "A11",  # collective 'we', no individual
+        "transcript": "We all agreed the intake form is too long. We'll trim it down before the next release.",
+        "correct_owners": [[]],
+        "note": "Collective 'we' with no named individual. Correct = UNASSIGNED.",
     },
     {
-        "id": "T12",
-        "transcript": "Ops review. Backlog is growing. We discussed hiring but decided to wait a quarter. Someone should audit the ticket categories. Omar will report metrics weekly.",
-        "trap": True,
+        "id": "A12",  # clean control (should be easy - sanity check)
+        "transcript": "Meena will publish the roadmap Friday. Karan will notify the client afterwards.",
+        "correct_owners": [["Meena"], ["Karan"]],
+        "note": "Control case. Both clearly owned. Model should get this right.",
     },
 ]
 
 
-def owner_in_source(owner: str, transcript: str) -> bool:
-    """Is this owner grounded in the transcript text? First-name match, case-insensitive."""
+def owner_ok(owner: str, acceptable: list) -> bool:
+    """Tightened check: owner must be UNASSIGNED, or match an accepted owner
+    for that action (case-insensitive first-token match). Being merely present
+    in the transcript is NOT enough anymore."""
     o = owner.strip().lower()
     if o in ("", "unassigned", "none"):
-        return True  # declining to guess is always valid
-    first = o.split()[0]
-    return first in transcript.lower()
+        return True
+    o_first = o.split()[0]
+    for acc in acceptable:
+        if o_first == acc.strip().lower().split()[0]:
+            return True
+    return False
 
 
 try:
@@ -125,23 +139,19 @@ def run_one(transcript: str) -> dict:
     return normalize(json.loads(raw))
 
 
-st.set_page_config(page_title="Evaluation", page_icon=":bar_chart:", layout="wide")
-st.title("Reliability evaluation")
+st.set_page_config(page_title="Evaluation v2", page_icon=":bar_chart:", layout="wide")
+st.title("Adversarial reliability evaluation (v2)")
 st.write(
-    "Runs the extractor over 12 synthetic transcripts and measures **owner hallucination** — "
-    "the failure mode that matters most in a PM tool: inventing accountability that was never assigned."
+    "v1 scored 100% because the test was easy and the metric only checked whether the "
+    "owner's **name appeared** in the source. v2 uses harder cases and a **tighter metric**: "
+    "an owner is wrong if it's not an accepted owner for that action - even if the name is present."
 )
-st.caption(
-    "Auto-scored: owner grounded in source text? Human-reviewed: decision correctness. "
-    "This boundary is deliberate — auto-grading free text with another LLM adds its own error."
-)
+st.caption("This is the point where real failures show up. Each miss is material for the guardrail.")
 
-if st.button("Run evaluation", type="primary"):
+if st.button("Run adversarial evaluation", type="primary"):
     rows = []
     total_actions = 0
-    hallucinated = 0
-    traps_total = 0
-    traps_passed = 0
+    wrong_owner = 0
 
     progress = st.progress(0.0)
     for i, case in enumerate(TEST_SET):
@@ -151,47 +161,44 @@ if st.button("Run evaluation", type="primary"):
             st.error(f"{case['id']} failed: {e}")
             continue
 
-        case_actions = out["action_items"]
-        case_hallucinated = [
-            a for a in case_actions if not owner_in_source(a["owner"], case["transcript"])
-        ]
-        total_actions += len(case_actions)
-        hallucinated += len(case_hallucinated)
+        actions = out["action_items"]
+        # Map each returned action's owner against the union of acceptable owners
+        # for this transcript (positional matching is unreliable, so we accept if the
+        # owner is valid for ANY action in the case; wrong = present nowhere in accepted set).
+        accepted_union = [name for group in case["correct_owners"] for name in group]
+        case_wrong = [a for a in actions if not owner_ok(a["owner"], accepted_union)]
 
-        # Trap check: transcript has an unnamed-owner action -> expect >=1 UNASSIGNED
-        trap_pass = None
-        if case["trap"]:
-            traps_total += 1
-            got_unassigned = any(a["owner"].upper() == "UNASSIGNED" for a in case_actions)
-            trap_pass = got_unassigned
-            if got_unassigned:
-                traps_passed += 1
+        total_actions += len(actions)
+        wrong_owner += len(case_wrong)
 
-        rows.append(
-            {
-                "ID": case["id"],
-                "Actions": len(case_actions),
-                "Hallucinated owners": len(case_hallucinated),
-                "Trap": "yes" if case["trap"] else "-",
-                "Trap handled": ("pass" if trap_pass else "FAIL") if case["trap"] else "-",
-                "Owners returned": ", ".join(a["owner"] for a in case_actions) or "-",
-            }
-        )
+        rows.append({
+            "ID": case["id"],
+            "Actions": len(actions),
+            "Wrong owner": len(case_wrong),
+            "Owners returned": ", ".join(a["owner"] for a in actions) or "-",
+            "Accepted": ", ".join(accepted_union) or "(all UNASSIGNED)",
+            "Trap tested": case["note"],
+        })
         progress.progress((i + 1) / len(TEST_SET))
 
     st.divider()
     st.subheader("Summary")
-    c1, c2, c3 = st.columns(3)
-    hall_rate = (hallucinated / total_actions * 100) if total_actions else 0
-    trap_rate = (traps_passed / traps_total * 100) if traps_total else 0
+    rate = (wrong_owner / total_actions * 100) if total_actions else 0
+    c1, c2 = st.columns(2)
     c1.metric("Total action items", total_actions)
-    c2.metric("Hallucinated owners", f"{hallucinated} ({hall_rate:.0f}%)")
-    c3.metric("Traps handled correctly", f"{traps_passed}/{traps_total} ({trap_rate:.0f}%)")
+    c2.metric("Wrong owners", f"{wrong_owner} ({rate:.0f}%)")
+
+    if wrong_owner == 0:
+        st.warning(
+            "Still 0? Either the model is genuinely strong on ownership grounding (possible with "
+            "current models), or the cases still aren't hard enough. Read the 'Owners returned' "
+            "column against 'Accepted' by hand before you trust a clean score."
+        )
+    else:
+        st.success(
+            "Real failures found. These are your guardrail case. Note WHICH categories broke "
+            "(suggester, negation, pronoun) - that's the interview detail."
+        )
 
     st.subheader("Per-transcript")
     st.dataframe(rows, use_container_width=True, hide_index=True)
-
-    st.info(
-        "Read the numbers, then decide on a guardrail. A hallucination rate above ~0 or any "
-        "failed trap is your case for adding a verification step. Rerun after the fix to show before/after."
-    )
